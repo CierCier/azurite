@@ -40,7 +40,7 @@ struct Azurite: ParsableCommand {
     var files: [String] = []
     
     // Options
-    @Option(name: .long, help: "Compression algorithm (none, zlib, gzip, lz4, zstd)")
+    @Option(name: .long, help: "Compression algorithm (none, zlib)")
     var compression: String = "none"
     
     @Option(name: .long, help: "Encryption algorithm (none, aes256)")
@@ -193,7 +193,7 @@ extension Azurite {
         @Argument(help: "Files to add to the archive")
         var files: [String] = []
         
-        @Option(name: .shortAndLong, help: "Compression algorithm (none, zlib, gzip, lz4, zstd)")
+        @Option(name: .shortAndLong, help: "Compression algorithm (none, zlib)")
         var compression: String = "none"
         
         @Option(name: .shortAndLong, help: "Encryption algorithm (none, aes256)")
@@ -208,11 +208,8 @@ extension Azurite {
             switch compression.lowercased() {
             case "none": compressionAlgo = .none
             case "zlib": compressionAlgo = .zlib
-            case "gzip": compressionAlgo = .gzip
-            case "lz4": compressionAlgo = .lz4
-            case "zstd": compressionAlgo = .zstd
             default:
-                print("Error: Invalid compression algorithm '\(compression)'")
+                print("Error: Invalid compression algorithm '\(compression)'. Valid options: none, zlib")
                 throw ExitCode.validationFailure
             }
             
