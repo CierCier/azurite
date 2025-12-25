@@ -116,6 +116,9 @@ struct CopperArchive {
     
     var freeSpaces: [CopperFreeSpace] = [] // Track freed spaces in the data section for reuse
     
+    // Maps archive filenames to source file paths (for writing archives)
+    var sourceFilePaths: [String: String] = [:]
+    
     var compressionEnabled: Bool {
         return (header.flags & CopperFlags.compressed.rawValue) != 0
     }
@@ -553,6 +556,17 @@ extension CopperArchive {
     
     /// Add a file to the archive from a file path
     mutating func addFile(at filePath: String, archiveName: String? = nil) throws {
+        let fileManager = FileManager.default
+        var isDirectory: ObjCBool = false
+        
+        guard fileManager.fileExists(atPath: filePath, isDirectory: &isDirectory) else {
+            throw CopperError.readError("File does not exist at \(filePath)")
+        }
+        
+        if isDirectory.boolValue {
+            throw CopperError.readError("Use addPath() for directories")
+        }
+        
         let fileURL = URL(fileURLWithPath: filePath)
         
         // Read file data
@@ -561,7 +575,6 @@ extension CopperArchive {
         }
         
         // Get file attributes
-        let fileManager = FileManager.default
         guard let attributes = try? fileManager.attributesOfItem(atPath: filePath) else {
             throw CopperError.readError("Cannot read file attributes at \(filePath)")
         }
@@ -575,29 +588,94 @@ extension CopperArchive {
         // Compute hash of file data
         let hash = fileData.sha256Hash()
         
-        // Find space for data
-        guard let offset = findSpaceForData(length: UInt64(fileData.count)) else {
-            throw CopperError.insufficientSpace
-        }
-        
         // Create file entry
         var entry = CopperFileEntry()
         entry.filename = name
         entry.filenameLength = UInt16(name.utf8.count)
-        entry.offset = offset
+        entry.offset = 0  // Will be set during writeToFile or when adding to existing archive
         entry.length = UInt64(fileData.count)
         entry.timestamp = UInt64(modificationDate.timeIntervalSince1970)
         entry.permissions = posixPermissions
         entry.hash = hash
         
-        // Add entry
-        fileEntries.append(entry)
-        
-        // Write data if file handle is available
+        // If we have an active file handle (modifying existing archive), allocate space and write now
         if let handle = fileHandle {
+            // Find space for data
+            guard let offset = findSpaceForData(length: UInt64(fileData.count)) else {
+                throw CopperError.insufficientSpace
+            }
+            
+            entry.offset = offset
+            
+            // Write data immediately
             handle.seek(toFileOffset: offset)
             try handle.write(contentsOf: fileData)
             try handle.synchronize()
+        } else {
+            // For new archives, track source path for deferred writing
+            sourceFilePaths[name] = filePath
+        }
+        
+        // Add entry
+        fileEntries.append(entry)
+    }
+    
+    /// Add a path (file or directory) to the archive, recursively if it's a directory
+    mutating func addPath(at path: String, baseDir: String? = nil) throws {
+        let fileManager = FileManager.default
+        var isDirectory: ObjCBool = false
+        
+        guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory) else {
+            throw CopperError.readError("Path does not exist at \(path)")
+        }
+        
+        if !isDirectory.boolValue {
+            // It's a file, add it directly
+            let archiveName: String?
+            if let base = baseDir {
+                // Compute relative path from base directory
+                let basePath = (base as NSString).standardizingPath
+                let fullPath = (path as NSString).standardizingPath
+                if fullPath.hasPrefix(basePath) {
+                    let relativePath = String(fullPath.dropFirst(basePath.count))
+                    archiveName = relativePath.hasPrefix("/") ? String(relativePath.dropFirst()) : relativePath
+                } else {
+                    archiveName = (path as NSString).lastPathComponent
+                }
+            } else {
+                archiveName = nil
+            }
+            try addFile(at: path, archiveName: archiveName)
+            return
+        }
+        
+        // It's a directory, recursively add all contents
+        let dirName = (path as NSString).lastPathComponent
+        let enumerator = fileManager.enumerator(atPath: path)
+        
+        while let relativePath = enumerator?.nextObject() as? String {
+            let fullPath = (path as NSString).appendingPathComponent(relativePath)
+            var isSubDir: ObjCBool = false
+            
+            guard fileManager.fileExists(atPath: fullPath, isDirectory: &isSubDir) else {
+                continue
+            }
+            
+            // Skip directories themselves (we only store files)
+            if isSubDir.boolValue {
+                continue
+            }
+            
+            // Prepend directory name to preserve structure
+            let archiveName = (dirName as NSString).appendingPathComponent(relativePath)
+            try addFile(at: fullPath, archiveName: archiveName)
+        }
+    }
+    
+    /// Add multiple paths (files or directories) to the archive
+    mutating func addPaths(_ paths: [String]) throws {
+        for path in paths {
+            try addPath(at: path)
         }
     }
     
@@ -631,6 +709,16 @@ extension CopperArchive {
         
         header.fileEntryOffset = headerSize
         header.dataOffset = headerSize + fileEntrySize
+        
+        // Calculate data offsets for each file entry before writing
+        var currentOffset = header.dataOffset
+        for i in 0..<fileEntries.count {
+            if fileEntries[i].offset == 0 {
+                // This entry needs an offset assigned
+                fileEntries[i].offset = currentOffset
+                currentOffset += fileEntries[i].length
+            }
+        }
         
         // Write header
         let headerData = header.serialize()
@@ -683,18 +771,29 @@ extension CopperArchive {
     
     /// Write the file data section to the file handle
     private func writeFileDataSection(to handle: FileHandle) throws {
-        // For each file entry, write its data at the specified offset
         for entry in fileEntries {
-            // Seek to the correct offset
+            // Get source file path (only present for new entries)
+            guard let sourcePath = sourceFilePaths[entry.filename] else {
+                // This entry's data was already written (modifying existing archive)
+                continue
+            }
+            
+            // Read file data from source
+            guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: sourcePath)) else {
+                throw CopperError.readError("Cannot read source file at \(sourcePath)")
+            }
+            
+            // Verify data length matches
+            guard UInt64(fileData.count) == entry.length else {
+                throw CopperError.writeError("File size mismatch for \(entry.filename)")
+            }
+            
+            // Seek to the correct offset and write
             handle.seek(toFileOffset: entry.offset)
-            
-            // In a real implementation, you would read the actual file data here
-            // For now, this assumes data was already written via addFile()
-            // or we need to read from the original file locations
-            
-            // TODO: If creating from scratch, need to track original file paths
-            // and read them here. For now, skip if data was already written.
+            try handle.write(contentsOf: fileData)
         }
+        
+        try handle.synchronize()
     }
     
     /// Add multiple files to the archive at once

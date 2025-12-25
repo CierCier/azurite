@@ -9,17 +9,174 @@ struct Azurite: ParsableCommand {
         discussion: """
             Azurite is a command-line tool for creating and managing Copper archives.
             """,
-        version: "1.0.0",
-        subcommands: [
-            Create.self,
-            Add.self,
-            Extract.self,
-            List.self,
-            Remove.self,
-            Compact.self,
-            Info.self
-        ]
+        version: "1.0.0"
     )
+    
+    // Operation flags (mutually exclusive)
+    @Flag(name: .shortAndLong, help: "Create or add to archive")
+    var create: Bool = false
+    
+    @Flag(name: [.customShort("x"), .long], help: "Extract files from archive")
+    var extract: Bool = false
+    
+    @Flag(name: .shortAndLong, help: "List files in archive")
+    var list: Bool = false
+    
+    @Flag(name: .shortAndLong, help: "Show archive information")
+    var info: Bool = false
+    
+    @Flag(name: .long, help: "Remove files from archive")
+    var remove: Bool = false
+    
+    @Flag(name: .long, help: "Compact archive to eliminate fragmentation")
+    var compact: Bool = false
+    
+    // Archive file
+    @Option(name: .shortAndLong, help: "Archive file path")
+    var file: String
+    
+    // Files to operate on
+    @Argument(help: "Files to add/extract/remove")
+    var files: [String] = []
+    
+    // Options
+    @Option(name: .long, help: "Compression algorithm (none, zlib, gzip, lz4, zstd)")
+    var compression: String = "none"
+    
+    @Option(name: .long, help: "Encryption algorithm (none, aes256)")
+    var encryption: String = "none"
+    
+    @Option(name: .shortAndLong, help: "Encryption key (if using encryption)")
+    var key: String?
+    
+    @Option(name: .shortAndLong, help: "Output directory for extraction")
+    var output: String?
+    
+    @Flag(name: .shortAndLong, help: "Verbose output")
+    var verbose: Bool = false
+    
+    mutating func run() throws {
+        // Count operation flags
+        let operations = [create, extract, list, info, remove, compact].filter { $0 }
+        guard operations.count == 1 else {
+            if operations.isEmpty {
+                throw ValidationError("Must specify one operation: -c, -x, -l, -i, --remove, or --compact")
+            } else {
+                throw ValidationError("Cannot specify multiple operations")
+            }
+        }
+        
+        if create {
+            try runCreateOrAdd()
+        } else if extract {
+            try runExtract()
+        } else if list {
+            try runList()
+        } else if info {
+            try runInfo()
+        } else if remove {
+            try runRemove()
+        } else if compact {
+            try runCompact()
+        }
+    }
+    
+    // MARK: - Operation Methods
+    
+    mutating func runExtract() throws {
+        let encryptionKey = key?.data(using: .utf8)
+        
+        // Open archive
+        if verbose {
+            print("Opening archive at \(file)...")
+        }
+        let archive = try CopperArchive.open(path: file, encryptionKey: encryptionKey)
+        
+        let outputDir = output ?? "."
+        
+        if files.isEmpty {
+            // Extract all files
+            if verbose {
+                print("Extracting all files to \(outputDir)...")
+            }
+            try archive.extractAll(toDirectory: outputDir)
+            if verbose {
+                print("Extracted \(archive.totalFiles()) file(s)")
+            }
+        } else {
+            // Extract specific files
+            if verbose {
+                print("Extracting \(files.count) file(s) to \(outputDir)...")
+            }
+            for filename in files {
+                do {
+                    let outputPath = (outputDir as NSString).appendingPathComponent(filename)
+                    try archive.extractFile(filename: filename, toPath: outputPath)
+                    if verbose {
+                        print("  Extracted: \(filename)")
+                    }
+                } catch {
+                    print("  Failed: \(filename): \(error)")
+                }
+            }
+        }
+    }
+    
+    mutating func runList() throws {
+        var listCmd = List()
+        listCmd.archivePath = file
+        listCmd.key = key
+        listCmd.verbose = verbose
+        try listCmd.run()
+    }
+    
+    mutating func runInfo() throws {
+        var infoCmd = Info()
+        infoCmd.archivePath = file
+        infoCmd.key = key
+        try infoCmd.run()
+    }
+    
+    mutating func runRemove() throws {
+        var removeCmd = Remove()
+        removeCmd.archivePath = file
+        removeCmd.files = files
+        removeCmd.key = key
+        try removeCmd.run()
+    }
+    
+    mutating func runCompact() throws {
+        var compactCmd = Compact()
+        compactCmd.archivePath = file
+        compactCmd.key = key
+        try compactCmd.run()
+    }
+    
+    mutating func runCreateOrAdd() throws {
+        let fileManager = FileManager.default
+        let archiveExists = fileManager.fileExists(atPath: file)
+        
+        if archiveExists {
+            // Archive exists, switch to add mode
+            if verbose {
+                print("Archive exists, adding files...")
+            }
+            var add = Add()
+            add.archivePath = file
+            add.files = files
+            add.key = key
+            try add.run()
+        } else {
+            // Create new archive
+            var create = Create()
+            create.archivePath = file
+            create.files = files
+            create.compression = compression
+            create.encryption = encryption
+            create.key = key
+            try create.run()
+        }
+    }
 }
 
 // MARK: - Create Command
@@ -89,13 +246,13 @@ extension Azurite {
             
             // Add files if provided
             if !files.isEmpty {
-                print("Adding \(files.count) file(s)...")
-                for file in files {
+                print("Adding \(files.count) item(s)...")
+                for filePath in files {
                     do {
-                        try archive.addFile(at: file)
-                        print("  Added: \(file)")
+                        try archive.addPath(at: filePath)
+                        print("  Added: \(filePath)")
                     } catch {
-                        print("  Failed: \(file): \(error)")
+                        print("  Failed: \(filePath): \(error)")
                     }
                 }
             }
@@ -139,13 +296,13 @@ extension Azurite {
             archive.fileHandle = handle
             
             // Add files
-            print("Adding \(files.count) file(s)...")
-            for file in files {
+            print("Adding \(files.count) item(s)...")
+            for filePath in files {
                 do {
-                    try archive.addFile(at: file)
-                    print("  Added: \(file)")
+                    try archive.addPath(at: filePath)
+                    print("  Added: \(filePath)")
                 } catch {
-                    print("  Failed: \(file): \(error)")
+                    print("  Failed: \(filePath): \(error)")
                 }
             }
             

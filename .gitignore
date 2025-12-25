@@ -8,5 +8,6 @@ DerivedData/
 .netrc
 
 /.vscode
+/test
 
 *.az
