@@ -14,10 +14,12 @@
 // ENC_KEY_HASH 32 bytes    // SHA-256 hash of the encryption key (if encryption is used, else all zeros. we never store the key itself, only its hash for verification)
 // FE_OFFSET    8 bytes     // offset to the start of the file entry section
 // DATA_OFFSET  8 bytes     // offset to the start of the file data section
+// SALT         32 bytes    // Random salt used for key derivation
 // RESERVED     32 bytes    // reserved for future use
 // HEADER_HASH  32 bytes    // SHA-256 hash of the header section (excluding this field)
 
 // File Entry Section
+// Note: If encryption is enabled, the entire file entry section (including LENGTH and COUNT) is encrypted
 // LENGTH       8 bytes  // length of this file entry section
 // COUNT        8 bytes  // number of files in this archive
 // For each file:
@@ -43,113 +45,137 @@ import Crypto
 import Czlib
 import Foundation
 
-let COPPER_VERSION_CURRENT: UInt8 = 1
-let COPPER_MAGIC_NUMBER: [UInt8] = [0x43, 0x4F, 0x50, 0x52]  // 'COPR'
+// DOCUMENT: Consider moving version and magic number to a configuration struct or static constants within CopperHeader to avoid global namespace pollution.
+public let COPPER_VERSION_CURRENT: UInt8 = 1
+public let COPPER_MAGIC_NUMBER: [UInt8] = [0x43, 0x4F, 0x50, 0x52]  // 'COPR'
 
-enum CopperCompressionAlgorithm: UInt8 {
+public enum CopperCompressionAlgorithm: UInt8 {
     case none = 0
     case zlib = 1
 }
 
-enum CopperEncryptionAlgorithm: UInt8 {
+public enum CopperEncryptionAlgorithm: UInt8 {
     case none = 0
     case aes256 = 1
     // impl as needed
     // aes256 is probably sufficient for most use cases
 }
 
-enum CopperFlags: UInt64 {
+public enum CopperFlags: UInt64 {
     case none = 0
     case compressed = 1  // 1 << 0
     case encrypted = 2  // 1 << 1
 
 }
 
-struct CopperHeader {
-    static let magic: [UInt8] = COPPER_MAGIC_NUMBER
-    static let version: UInt8 = 1
-    static let headerLength: UInt64 = 143  // 4+1+8+8+8+1+1+32+8+8+32+32
-    var flags: UInt64 = 0
-    var timestamp: UInt64 = 0
-    var compressionAlgorithm: UInt8 = 0
-    var encryptionAlgorithm: UInt8 = 0
-    var encryptionKeyHash: [UInt8] = Array(repeating: 0, count: 32)
-    var fileEntryOffset: UInt64 = 0
-    var dataOffset: UInt64 = 0
-    var reserved: [UInt8] = Array(repeating: 0, count: 32)
-    var headerHash: [UInt8] = Array(repeating: 0, count: 32)
+// Archive structure and limits.
+// Update These if theres any breaking changes to the format.
+public struct CopperConstants {
+    public static let headerLength: UInt64 = 175
+    public static let endMarkerLength = 16
+    public static let fileEntryHeaderLength = 16
+    public static let aesGcmNonceSize = 12
+    public static let aesGcmTagSize = 16
+    public static let aesGcmOverhead = aesGcmNonceSize + aesGcmTagSize
+    public static let hashSize = 32
+    public static let keySize = 32
+    public static let saltSize = 32
+    public static let reservedSize = 32
+    public static let fileEntryFixedSize = 58
+    public static let defaultChunkSize = 32768
+    public static let defaultBufferSize = 1024 * 1024
+    public static let maxDecompressedSize = 256 * 1024 * 1024
+    public static let defaultPermissions: UInt16 = 0o644
 }
 
-struct CopperFileEntry {
-    var filenameLength: UInt16 = 0
-    var filename: String = ""
-    var offset: UInt64 = 0
-    var length: UInt64 = 0
-    var timestamp: UInt64 = 0
-    var permissions: UInt16 = 0
-    var hash: [UInt8] = Array(repeating: 0, count: 32)
+public struct CopperHeader {
+    public static let magic: [UInt8] = COPPER_MAGIC_NUMBER
+    public static let version: UInt8 = COPPER_VERSION_CURRENT
+    public static let headerLength: UInt64 = CopperConstants.headerLength
+    public var flags: UInt64 = 0
+    public var timestamp: UInt64 = 0
+    public var compressionAlgorithm: UInt8 = 0
+    public var encryptionAlgorithm: UInt8 = 0
+    public var encryptionKeyHash: [UInt8] = Array(repeating: 0, count: CopperConstants.hashSize)
+    public var fileEntryOffset: UInt64 = 0
+    public var dataOffset: UInt64 = 0
+    public var salt: [UInt8] = Array(repeating: 0, count: CopperConstants.saltSize)
+    public var reserved: [UInt8] = Array(repeating: 0, count: CopperConstants.reservedSize)
+    public var headerHash: [UInt8] = Array(repeating: 0, count: CopperConstants.hashSize)
+    
+    public init() {}
 }
 
-struct CopperFreeSpace {
-    var offset: UInt64
-    var length: UInt64
+public struct CopperFileEntry {
+    public var filenameLength: UInt16 = 0
+    public var filename: String = ""
+    public var offset: UInt64 = 0
+    public var length: UInt64 = 0
+    public var timestamp: UInt64 = 0
+    public var permissions: UInt16 = 0
+    public var hash: [UInt8] = Array(repeating: 0, count: CopperConstants.hashSize)
+    
+    public init() {}
 }
 
-struct CopperArchive {
-    var header: CopperHeader
-    var fileEntries: [CopperFileEntry]
-    var fileData: UInt64 = 0  // ptr to file data section in file
-    var endMarker: [UInt8] = Array(repeating: 0x45, count: 16)  // 'EEEEEEEEEEEEEEEE'
+public struct CopperFreeSpace {
+    public var offset: UInt64
+    public var length: UInt64
+}
+
+public struct CopperArchive {
+    public var header: CopperHeader
+    public var fileEntries: [CopperFileEntry]
+    public var fileData: UInt64 = 0  // ptr to file data section in file
+    public var endMarker: [UInt8] = Array(repeating: 0x45, count: CopperConstants.endMarkerLength)  // 'EEEEEEEEEEEEEEEE'
 
     // This marks the end of the archive format.
     // Below are runtime properties, not part of the archive format.
 
-    var filePath: String = ""  // path to the archive file on disk
-    var fileHandle: FileHandle? = nil  // file handle for reading/writing
+    public var filePath: String = ""  // path to the archive file on disk
+    public var fileHandle: FileHandle? = nil  // file handle for reading/writing
 
-    var encryptionKey: Data? = nil  // encryption key used for encrypting/decrypting files
+    public var encryptionKey: Data? = nil  // encryption key used for encrypting/decrypting files
 
-    var freeSpaces: [CopperFreeSpace] = []  // Track freed spaces in the data section for reuse
+    public var freeSpaces: [CopperFreeSpace] = []  // Track freed spaces in the data section for reuse
 
     // Maps archive filenames to source file paths (for writing archives)
-    var sourceFilePaths: [String: String] = [:]
+    public var sourceFilePaths: [String: String] = [:]
 
-    // Cache compressed data to avoid re-compressing during write
-    var compressedDataCache: [String: Data] = [:]
-
-    var compressionEnabled: Bool {
+    public var compressionEnabled: Bool {
         return (header.flags & CopperFlags.compressed.rawValue) != 0
     }
 
-    var encryptionEnabled: Bool {
+    public var encryptionEnabled: Bool {
         return (header.flags & CopperFlags.encrypted.rawValue) != 0
     }
 
-    var compressionAlgorithm: CopperCompressionAlgorithm {
+    public var compressionAlgorithm: CopperCompressionAlgorithm {
         return CopperCompressionAlgorithm(rawValue: header.compressionAlgorithm) ?? .none
     }
 
-    var encryptionAlgorithm: CopperEncryptionAlgorithm {
+    public var encryptionAlgorithm: CopperEncryptionAlgorithm {
         return CopperEncryptionAlgorithm(rawValue: header.encryptionAlgorithm) ?? .none
     }
 
     // Below are some utility functions as needed
 
-    func totalFiles() -> UInt64 {
+    public func totalFiles() -> UInt64 {
         return UInt64(fileEntries.count)
     }
 
     /// Find a file entry by filename, returns the index if found
-    func findFileEntry(filename: String) -> Int? {
+    public func findFileEntry(filename: String) -> Int? {
         return fileEntries.firstIndex(where: { $0.filename == filename })
     }
 
     mutating func findSpaceForData(length: UInt64) -> UInt64? {
         // Find a suitable space for new data of given length in the archive
-        // Strategy: First-fit algorithm - find first free space that fits
+        // Strategy: Best-fit algorithm - find the smallest free space that fits
+        // This minimizes fragmentation by preserving larger spaces for larger files.
 
-        // Sort free spaces by offset to make searching easier
-        freeSpaces.sort { $0.offset < $1.offset }
+        // Sort free spaces by length (ascending) to find the smallest sufficient space
+        freeSpaces.sort { $0.length < $1.length }
 
         // Look for a free space that fits
         for (index, freeSpace) in freeSpaces.enumerated() {
@@ -185,7 +211,7 @@ struct CopperArchive {
     // MARK: - File Management
 
     /// Remove a file from the archive and mark its space as free
-    mutating func removeFile(filename: String) throws {
+    public mutating func removeFile(filename: String) throws {
         guard let index = fileEntries.firstIndex(where: { $0.filename == filename }) else {
             throw CopperError.fileNotFound(filename)
         }
@@ -234,7 +260,7 @@ struct CopperArchive {
     }
 
     /// Relocate file data from one offset to another within the data section
-    /// This reads from the old offset and writes to the new offset
+    /// This reads from the old offset and writes to the new offset using a buffer
     mutating func relocateFileData(from oldOffset: UInt64, length: UInt64, to newOffset: UInt64)
         throws
     {
@@ -246,26 +272,73 @@ struct CopperArchive {
         guard oldOffset >= header.dataOffset && newOffset >= header.dataOffset else {
             throw CopperError.invalidOffset
         }
+        
+        if oldOffset == newOffset { return }
 
-        // Read data from old location
-        handle.seek(toFileOffset: oldOffset)
-        guard let data = try handle.read(upToCount: Int(length)) else {
-            throw CopperError.readError("Failed to read data at offset \(oldOffset)")
+        let bufferSize = CopperConstants.defaultBufferSize // 1 MB buffer
+        var bytesRemaining = length
+        
+        if newOffset < oldOffset {
+            // Moving data "left" (to lower offset) - Copy forward
+            var currentReadOffset = oldOffset
+            var currentWriteOffset = newOffset
+            
+            while bytesRemaining > 0 {
+                let bytesToRead = min(UInt64(bufferSize), bytesRemaining)
+                
+                handle.seek(toFileOffset: currentReadOffset)
+                guard let data = try handle.read(upToCount: Int(bytesToRead)) else {
+                    throw CopperError.readError("Failed to read data at offset \(currentReadOffset)")
+                }
+                
+                guard data.count == Int(bytesToRead) else {
+                    throw CopperError.readError("Read \(data.count) bytes but expected \(bytesToRead)")
+                }
+                
+                handle.seek(toFileOffset: currentWriteOffset)
+                try handle.write(contentsOf: data)
+                
+                currentReadOffset += bytesToRead
+                currentWriteOffset += bytesToRead
+                bytesRemaining -= bytesToRead
+            }
+        } else {
+            // Moving data "right" (to higher offset) - Copy backward to handle overlap
+            // We need to start from the end of the block
+            var currentReadOffset = oldOffset + length
+            var currentWriteOffset = newOffset + length
+            
+            while bytesRemaining > 0 {
+                let bytesToRead = min(UInt64(bufferSize), bytesRemaining)
+                
+                // Calculate start of this chunk
+                let chunkReadStart = currentReadOffset - bytesToRead
+                let chunkWriteStart = currentWriteOffset - bytesToRead
+                
+                handle.seek(toFileOffset: chunkReadStart)
+                guard let data = try handle.read(upToCount: Int(bytesToRead)) else {
+                    throw CopperError.readError("Failed to read data at offset \(chunkReadStart)")
+                }
+                
+                guard data.count == Int(bytesToRead) else {
+                    throw CopperError.readError("Read \(data.count) bytes but expected \(bytesToRead)")
+                }
+                
+                handle.seek(toFileOffset: chunkWriteStart)
+                try handle.write(contentsOf: data)
+                
+                currentReadOffset -= bytesToRead
+                currentWriteOffset -= bytesToRead
+                bytesRemaining -= bytesToRead
+            }
         }
-
-        guard data.count == Int(length) else {
-            throw CopperError.readError("Read \(data.count) bytes but expected \(length)")
-        }
-
-        // Write data to new location
-        handle.seek(toFileOffset: newOffset)
-        try handle.write(contentsOf: data)
+        
         try handle.synchronize()
     }
 
     /// Compact the archive by moving all files forward to eliminate gaps
     /// This eliminates all free spaces and makes the archive contiguous
-    mutating func compactArchive() throws {
+    public mutating func compactArchive() throws {
         guard let handle = fileHandle else {
             throw CopperError.writeError("File handle not available")
         }
@@ -286,6 +359,10 @@ struct CopperArchive {
             }
 
             // Move the file data
+            // REVIEW: If newOffset overlaps with oldOffset, this might corrupt data if not handled carefully.
+            // Since we are compacting (moving to lower offsets), and we iterate by sorted offset,
+            // we are moving data "left". If we read the whole chunk into memory (as relocateFileData currently does), it's safe.
+            // But if we switch to buffered reading/writing, we must ensure we don't overwrite data we haven't read yet.
             try relocateFileData(from: entry.offset, length: entry.length, to: currentWriteOffset)
 
             // Update the entry with new offset
@@ -314,13 +391,13 @@ struct CopperArchive {
         try handle.write(contentsOf: Data(endMarker))
 
         // Truncate file to final size
-        try handle.truncate(atOffset: endMarkerOffset + 16)
+        try handle.truncate(atOffset: endMarkerOffset + UInt64(CopperConstants.endMarkerLength))
         try handle.synchronize()
     }
 
     /// Update a file in the archive with new data
     /// If the new data fits in the old space, it reuses it; otherwise it relocates the file
-    mutating func updateFile(filename: String, newData: Data, newHash: [UInt8]) throws {
+    public mutating func updateFile(filename: String, newData: Data, newHash: [UInt8]) throws {
         guard let index = fileEntries.firstIndex(where: { $0.filename == filename }) else {
             throw CopperError.fileNotFound(filename)
         }
@@ -345,6 +422,7 @@ struct CopperArchive {
             fileEntries[index].timestamp = UInt64(Date().timeIntervalSince1970)
 
             // If there's leftover space, mark it as free
+            // REVIEW: This can lead to high fragmentation if files are frequently updated with slightly smaller data.
             if newLength < oldEntry.length {
                 let leftoverOffset = oldEntry.offset + newLength
                 let leftoverLength = oldEntry.length - newLength
@@ -377,7 +455,7 @@ struct CopperArchive {
     }
 }
 
-enum CopperError: Error {
+public enum CopperError: Error {
     case fileNotFound(String)
     case insufficientSpace
     case invalidOffset
@@ -406,6 +484,8 @@ extension CopperCompressionAlgorithm {
     private func compressWithZlib(_ data: Data) throws -> Data {
         // Estimate compressed size (worst case: original size + 0.1% + 12 bytes)
         let maxCompressedSize = data.count + data.count / 1000 + 12
+        // Consider using a streaming approach or chunked compression to reduce memory footprint.
+        // REVIEW: Allocating a large buffer based on input size can be problematic for large files.
         var compressedData = Data(count: maxCompressedSize)
         var compressedSize = UInt(maxCompressedSize)
 
@@ -432,21 +512,32 @@ extension CopperCompressionAlgorithm {
 
     /// Decompress data using the specified algorithm
     func decompress(_ data: Data, uncompressedSize: Int) throws -> Data {
+        // Define a reasonable limit for in-memory decompression to prevent Zip bombs
+        let maxAllowedSize = CopperConstants.maxDecompressedSize // 256 MB
+        
+        if uncompressedSize > maxAllowedSize {
+             throw CopperError.compressionError("Uncompressed size \(uncompressedSize) exceeds limit of \(maxAllowedSize) bytes")
+        }
+        
         switch self {
         case .none:
             return data
         case .zlib:
-            return try decompressWithZlib(data, uncompressedSize: uncompressedSize)
+            return try decompressWithZlib(data, uncompressedSize: uncompressedSize, limit: maxAllowedSize)
         }
     }
 
     /// Decompress data using system zlib
-    private func decompressWithZlib(_ data: Data, uncompressedSize: Int) throws -> Data {
-        // If uncompressedSize is 0, use streaming decompression
-        if uncompressedSize == 0 {
-            return try decompressWithZlibStreaming(data)
+    private func decompressWithZlib(_ data: Data, uncompressedSize: Int, limit: Int) throws -> Data {
+        // If uncompressedSize is 0 or very large, use streaming decompression to avoid large contiguous allocation
+        // This mitigates the risk of DoS via large allocation requests
+        if uncompressedSize == 0 || uncompressedSize > 10 * 1024 * 1024 { // 10 MB
+            return try decompressWithZlibStreaming(data, limit: limit)
         }
 
+        // REVIEW: Allocating memory based on uncompressedSize from the archive header is a potential DoS vector (Zip bomb).
+        // Although `maxAllowedSize` is checked above, allocating the full buffer upfront is still risky if multiple threads do this.
+        // FIX: Validate uncompressedSize against a reasonable limit or available memory.
         var decompressedData = Data(count: uncompressedSize)
         var decompressedSize = UInt(uncompressedSize)
 
@@ -487,7 +578,7 @@ extension CopperCompressionAlgorithm {
     }
 
     /// Decompress using streaming API when uncompressed size is unknown
-    private func decompressWithZlibStreaming(_ data: Data) throws -> Data {
+    private func decompressWithZlibStreaming(_ data: Data, limit: Int) throws -> Data {
         var stream = z_stream()
         stream.zalloc = nil
         stream.zfree = nil
@@ -507,7 +598,7 @@ extension CopperCompressionAlgorithm {
         defer { inflateEnd(&stream) }
 
         var decompressedData = Data()
-        let chunkSize = 32768  // 32KB chunks
+        let chunkSize = CopperConstants.defaultChunkSize  // 32KB chunks
         var outBuffer = [UInt8](repeating: 0, count: chunkSize)
 
         repeat {
@@ -524,6 +615,10 @@ extension CopperCompressionAlgorithm {
 
             let have = chunkSize - Int(stream.avail_out)
             decompressedData.append(contentsOf: outBuffer[0..<have])
+            
+            if decompressedData.count > limit {
+                throw CopperError.compressionError("Decompressed data exceeds limit of \(limit) bytes")
+            }
 
         } while result != Z_STREAM_END
 
@@ -560,7 +655,7 @@ extension CopperEncryptionAlgorithm {
     /// GCM provides authenticated encryption, protecting against tampering
     private func encryptWithAES256GCM(_ data: Data, key: Data) throws -> Data {
         // Verify key is 32 bytes (256 bits)
-        guard key.count == 32 else {
+        guard key.count == CopperConstants.keySize else {
             throw CopperError.encryptionError("AES-256 requires a 32-byte (256-bit) key")
         }
 
@@ -585,7 +680,7 @@ extension CopperEncryptionAlgorithm {
     /// Decrypt data using AES-256-GCM
     private func decryptWithAES256GCM(_ data: Data, key: Data) throws -> Data {
         // Verify key is 32 bytes (256 bits)
-        guard key.count == 32 else {
+        guard key.count == CopperConstants.keySize else {
             throw CopperError.encryptionError("AES-256 requires a 32-byte (256-bit) key")
         }
 
@@ -594,9 +689,9 @@ extension CopperEncryptionAlgorithm {
 
         // The data should contain: nonce (12 bytes) + ciphertext + tag (16 bytes)
         // Minimum size: 12 + 0 + 16 = 28 bytes
-        guard data.count >= 28 else {
+        guard data.count >= CopperConstants.aesGcmOverhead else {
             throw CopperError.encryptionError(
-                "Encrypted data too short (minimum 28 bytes required)")
+                "Encrypted data too short (minimum \(CopperConstants.aesGcmOverhead) bytes required)")
         }
 
         // Create sealed box from combined data
@@ -618,7 +713,7 @@ extension CopperEncryptionAlgorithm {
 
     /// Derive a 256-bit encryption key from a password using HKDF
     /// This provides better security than using the password directly
-    static func deriveKey(from password: String, salt: Data? = nil) throws -> Data {
+    public static func deriveKey(from password: String, salt: Data? = nil) throws -> Data {
         guard let passwordData = password.data(using: .utf8) else {
             throw CopperError.encryptionError("Failed to convert password to data")
         }
@@ -626,6 +721,9 @@ extension CopperEncryptionAlgorithm {
         // Use provided salt or generate a random one
         // For Copper archives, we'll use a deterministic salt based on the magic number
         // This allows the same password to always produce the same key
+        // This requires changing the archive format or how the key is stored/retrieved.
+        // REVIEW: Using a deterministic salt reduces security against rainbow table attacks.
+        // FIX: Generate a random salt, store it in the archive header, and use it for key derivation.
         let usedSalt = salt ?? Data(COPPER_MAGIC_NUMBER + [0x45, 0x4E, 0x43])  // 'COPR' + 'ENC'
 
         // Create input key material from password
@@ -636,7 +734,7 @@ extension CopperEncryptionAlgorithm {
             inputKeyMaterial: inputKeyMaterial,
             salt: usedSalt,
             info: Data("copper-archive-encryption".utf8),
-            outputByteCount: 32  // 256 bits
+            outputByteCount: CopperConstants.keySize  // 256 bits
         )
 
         return derivedKey.withUnsafeBytes { Data($0) }
@@ -737,6 +835,9 @@ extension CopperHeader {
 
         // DATA_OFFSET - 8 bytes
         data.appendUInt64(dataOffset)
+        
+        // SALT - 32 bytes (Added in V2)
+        data.appendBytes(salt)
 
         // RESERVED - 32 bytes
         data.appendBytes(reserved)
@@ -787,16 +888,24 @@ extension CopperArchive {
     // MARK: - Archive Creation
 
     /// Initialize a new empty archive
-    static func createNew(
+    public static func createNew(
         compressionAlgorithm: CopperCompressionAlgorithm = .none,
         encryptionAlgorithm: CopperEncryptionAlgorithm = .none,
-        encryptionKey: Data? = nil
+        encryptionKey: Data? = nil,
+        salt: Data? = nil
     ) -> CopperArchive {
         var header = CopperHeader()
         header.timestamp = UInt64(Date().timeIntervalSince1970)
         header.compressionAlgorithm = compressionAlgorithm.rawValue
         header.encryptionAlgorithm = encryptionAlgorithm.rawValue
         header.fileEntryOffset = CopperHeader.headerLength
+        
+        // Generate random salt if not provided
+        if let providedSalt = salt {
+            header.salt = Array(providedSalt)
+        } else {
+            header.salt = (0..<CopperConstants.saltSize).map { _ in UInt8.random(in: 0...255) }
+        }
 
         // Set flags based on algorithms
         if compressionAlgorithm != .none {
@@ -818,7 +927,7 @@ extension CopperArchive {
     }
 
     /// Add a file to the archive from a file path
-    mutating func addFile(at filePath: String, archiveName: String? = nil) throws {
+    public mutating func addFile(at filePath: String, archiveName: String? = nil) throws {
         let fileManager = FileManager.default
         var isDirectory: ObjCBool = false
 
@@ -832,10 +941,31 @@ extension CopperArchive {
 
         let fileURL = URL(fileURLWithPath: filePath)
 
-        // Read file data
-        guard let fileData = try? Data(contentsOf: fileURL) else {
-            throw CopperError.readError("Cannot read file at \(filePath)")
+        // REVIEW: Reading the entire file to compute hash before adding is inefficient for large files.
+        // Consider computing hash while compressing/writing if possible, or using a faster hash if integrity check speed is critical.
+        // Compute hash of UNCOMPRESSED file data (for integrity verification)
+        // Stream read for hash to avoid loading large files into memory just for checking
+        guard let readHandle = FileHandle(forReadingAtPath: filePath) else {
+             throw CopperError.readError("Cannot read file at \(filePath)")
         }
+        
+        var hasher = SHA256()
+        let bufferSize = CopperConstants.defaultBufferSize
+        var fileSize: UInt64 = 0
+        
+        while true {
+            let data = try readHandle.read(upToCount: bufferSize)
+            if let data = data, !data.isEmpty {
+                hasher.update(data: data)
+                fileSize += UInt64(data.count)
+            } else {
+                break
+            }
+        }
+        let hash = Array(hasher.finalize())
+        
+        // Close handle to reset for later reading if needed
+        try? readHandle.close()
 
         // Get file attributes
         guard let attributes = try? fileManager.attributesOfItem(atPath: filePath) else {
@@ -843,13 +973,11 @@ extension CopperArchive {
         }
 
         let modificationDate = attributes[.modificationDate] as? Date ?? Date()
-        let posixPermissions = attributes[.posixPermissions] as? UInt16 ?? 0o644
+        // REVIEW: Magic number 0o644. Use a constant or proper permission handling.
+        let posixPermissions = attributes[.posixPermissions] as? UInt16 ?? CopperConstants.defaultPermissions
 
         // Use provided archive name or file name
         let name = archiveName ?? fileURL.lastPathComponent
-
-        // Compute hash of UNCOMPRESSED file data (for integrity verification)
-        let hash = fileData.sha256Hash()
 
         // Check if file already exists in archive
         if let existingIndex = findFileEntry(filename: name) {
@@ -874,13 +1002,33 @@ extension CopperArchive {
         entry.filename = name
         entry.filenameLength = UInt16(name.utf8.count)
         entry.offset = 0  // Will be set during writeToFile or when adding to existing archive
-        entry.length = UInt64(fileData.count)  // Will be updated with compressed size during write
+        entry.length = fileSize  // Will be updated with compressed size during write
         entry.timestamp = UInt64(modificationDate.timeIntervalSince1970)
         entry.permissions = posixPermissions
         entry.hash = hash  // Hash of UNCOMPRESSED data
 
         // If we have an active file handle (modifying existing archive), compress and write now
-        if let handle = fileHandle {
+        // Or if we have a file path but no handle (e.g. opened archive), open it temporarily
+        var handleToClose: FileHandle? = nil
+        var activeHandle = fileHandle
+        
+        if activeHandle == nil && !self.filePath.isEmpty {
+             // Open for updating
+             // print("DEBUG: Opening \(self.filePath) for updating in addFile")
+             activeHandle = FileHandle(forUpdatingAtPath: self.filePath)
+             // if activeHandle == nil { print("DEBUG: Failed to open handle in addFile") }
+             handleToClose = activeHandle
+             // We don't set self.fileHandle here to avoid side effects on other methods expecting it to be nil/closed
+        }
+
+        if let handle = activeHandle {
+            // Re-read file data for writing
+            // Note: We still read full file here because we need to know compressed size 
+            // before allocating space. To fix this, we would need to compress to a temp file.
+            guard let fileData = try? Data(contentsOf: fileURL) else {
+                throw CopperError.readError("Cannot read file at \(filePath)")
+            }
+            
             // Compress data if needed
             var dataToStore: Data
             if compressionEnabled && compressionAlgorithm != .none {
@@ -907,12 +1055,22 @@ extension CopperArchive {
             entry.offset = offset
 
             // Write data immediately
-            handle.seek(toFileOffset: offset)
+            // print("DEBUG: Seeking to \(offset) for writing data")
+            if #available(macOS 10.15.4, iOS 13.4, watchOS 6.2, tvOS 13.4, *) {
+                try handle.seek(toOffset: offset)
+            } else {
+                handle.seek(toFileOffset: offset)
+            }
+            // print("DEBUG: Writing \(dataToStore.count) bytes")
             try handle.write(contentsOf: dataToStore)
             try handle.synchronize()
         } else {
             // For new archives, track source path for deferred compression/writing
             sourceFilePaths[name] = filePath
+        }
+        
+        if let h = handleToClose {
+            try? h.close()
         }
 
         // Add or update entry
@@ -926,7 +1084,7 @@ extension CopperArchive {
     }
 
     /// Add a path (file or directory) to the archive, recursively if it's a directory
-    mutating func addPath(at path: String, baseDir: String? = nil) throws {
+    public mutating func addPath(at path: String, baseDir: String? = nil) throws {
         let fileManager = FileManager.default
         var isDirectory: ObjCBool = false
 
@@ -980,14 +1138,14 @@ extension CopperArchive {
     }
 
     /// Add multiple paths (files or directories) to the archive
-    mutating func addPaths(_ paths: [String]) throws {
+    public mutating func addPaths(_ paths: [String]) throws {
         for path in paths {
             try addPath(at: path)
         }
     }
 
     /// Write the complete archive to disk
-    mutating func writeToFile(path: String) throws {
+    public mutating func writeToFile(path: String) throws {
         let fileManager = FileManager.default
 
         // Create parent directory if needed
@@ -1010,78 +1168,77 @@ extension CopperArchive {
             try? handle.close()
         }
 
-        // Pre-compress all files and cache the data (so we know the compressed sizes)
-        let compressionAlgo = compressionAlgorithm
-        let shouldCompress = compressionEnabled && compressionAlgo != .none
-        let shouldEncrypt = encryptionEnabled && encryptionAlgorithm != .none
-
-        if shouldCompress || shouldEncrypt {
-            if shouldCompress {
-                print("Compressing files...")
-            }
-            if shouldEncrypt {
-                print("Encrypting files...")
-            }
-
-            for i in 0..<fileEntries.count {
-                guard let sourcePath = sourceFilePaths[fileEntries[i].filename] else {
-                    continue  // Already written or no source
-                }
-
-                guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: sourcePath)) else {
-                    throw CopperError.readError("Cannot read source file at \(sourcePath)")
-                }
-
-                // Apply compression first (if enabled)
-                var processedData = fileData
-                if shouldCompress {
-                    processedData = try compressionAlgo.compress(processedData)
-                }
-
-                // Apply encryption after compression (if enabled)
-                if shouldEncrypt {
-                    guard let key = encryptionKey else {
-                        throw CopperError.encryptionError("Encryption enabled but no key provided")
-                    }
-                    processedData = try encryptionAlgorithm.encrypt(processedData, key: key)
-                }
-
-                compressedDataCache[fileEntries[i].filename] = processedData
-                fileEntries[i].length = UInt64(processedData.count)
-
-                print("  [\(i+1)/\(fileEntries.count)] \(fileEntries[i].filename)")
-            }
-        }
-
         // Calculate offsets
         let headerSize = CopperHeader.headerLength
         let fileEntrySize = calculateFileEntrySectionSize()
+        // If encryption is enabled, the file entry section will be larger due to nonce + tag
+        let actualFileEntrySize = encryptionEnabled ? fileEntrySize + UInt64(CopperConstants.aesGcmOverhead) : fileEntrySize
 
         header.fileEntryOffset = headerSize
-        header.dataOffset = headerSize + fileEntrySize
+        header.dataOffset = headerSize + actualFileEntrySize
+        
+        // Write placeholder header
+        try handle.write(contentsOf: header.serialize())
+        
+        // Write placeholder file entry section to reserve space
+        try handle.write(contentsOf: Data(count: Int(actualFileEntrySize)))
 
-        // Calculate data offsets for each file entry before writing
+        // Write data section sequentially
         var currentOffset = header.dataOffset
+        let compressionAlgo = compressionAlgorithm
+        let shouldCompress = compressionEnabled && compressionAlgo != .none
+        let shouldEncrypt = encryptionEnabled && encryptionAlgorithm != .none
+        
         for i in 0..<fileEntries.count {
-            if fileEntries[i].offset == 0 {
-                // This entry needs an offset assigned
-                fileEntries[i].offset = currentOffset
-                currentOffset += fileEntries[i].length
+            guard let sourcePath = sourceFilePaths[fileEntries[i].filename] else {
+                continue  // Already written or no source
             }
+
+            // REVIEW: Reading entire source file into memory.
+            // FIX: For now we still read into memory because encryption/compression APIs used here are not streaming.
+            // To fix this properly, we need to implement chunked processing for compression and encryption.
+            guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: sourcePath)) else {
+                throw CopperError.readError("Cannot read source file at \(sourcePath)")
+            }
+
+            // Apply compression first (if enabled)
+            var processedData = fileData
+            if shouldCompress {
+                processedData = try compressionAlgo.compress(processedData)
+            }
+
+            // Apply encryption after compression (if enabled)
+            if shouldEncrypt {
+                guard let key = encryptionKey else {
+                    throw CopperError.encryptionError("Encryption enabled but no key provided")
+                }
+                processedData = try encryptionAlgorithm.encrypt(processedData, key: key)
+            }
+
+            // Write processed data
+            handle.seek(toFileOffset: currentOffset)
+            try handle.write(contentsOf: processedData)
+            
+            // Update entry
+            fileEntries[i].offset = currentOffset
+            fileEntries[i].length = UInt64(processedData.count)
+            
+            currentOffset += UInt64(processedData.count)
+            print("+[\(i+1)/\(fileEntries.count)] \(fileEntries[i].filename)")
         }
-
-        // Write header
-        let headerData = header.serialize()
-        try handle.write(contentsOf: headerData)
-
-        // Write file entry section
-        try writeFileEntrySection(to: handle)
-
-        // Write file data section
-        try writeFileDataSection(to: handle)
+        
 
         // Write end marker
         try handle.write(contentsOf: Data(endMarker))
+        
+        // Rewrite header with correct timestamp
+        header.timestamp = UInt64(Date().timeIntervalSince1970)
+        handle.seek(toFileOffset: 0)
+        try handle.write(contentsOf: header.serialize())
+
+        // Rewrite file entry section with correct offsets/lengths
+        handle.seek(toFileOffset: header.fileEntryOffset)
+        try writeFileEntrySection(to: handle)
 
         try handle.synchronize()
     }
@@ -1089,12 +1246,12 @@ extension CopperArchive {
     /// Calculate the total size of the file entry section
     private func calculateFileEntrySectionSize() -> UInt64 {
         // LENGTH (8) + COUNT (8) + sum of all entry sizes
-        var totalSize: UInt64 = 16
+        var totalSize: UInt64 = UInt64(CopperConstants.fileEntryHeaderLength)
 
         for entry in fileEntries {
             // FILENAME_LENGTH (2) + FILENAME (variable) + OFFSET (8) + LENGTH (8) +
             // TIMESTAMP (8) + PERMISSIONS (2) + HASH (32)
-            totalSize += 2 + UInt64(entry.filename.utf8.count) + 8 + 8 + 8 + 2 + 32
+            totalSize += 2 + UInt64(entry.filename.utf8.count) + UInt64(CopperConstants.fileEntryFixedSize)
         }
 
         return totalSize
@@ -1116,53 +1273,38 @@ extension CopperArchive {
             data.append(entry.serialize())
         }
 
-        try handle.write(contentsOf: data)
+        // Encrypt file entry section if encryption is enabled
+        let finalData: Data
+        if encryptionEnabled {
+            guard let key = encryptionKey else {
+                throw CopperError.encryptionError("Archive is encrypted but no key provided")
+            }
+            finalData = try encryptionAlgorithm.encrypt(data, key: key)
+        } else {
+            finalData = data
+        }
+
+        try handle.write(contentsOf: finalData)
     }
 
     /// Write the file data section to the file handle
     private mutating func writeFileDataSection(to handle: FileHandle) throws {
-        for entry in fileEntries {
-            // Check if we have cached compressed data first
-            if let cachedData = compressedDataCache[entry.filename] {
-                // Use cached compressed data
-                guard UInt64(cachedData.count) == entry.length else {
-                    throw CopperError.writeError("Cached data size mismatch for \(entry.filename)")
-                }
-
-                handle.seek(toFileOffset: entry.offset)
-                try handle.write(contentsOf: cachedData)
-                continue
-            }
-
-            // Get source file path (only present for new entries)
-            guard let sourcePath = sourceFilePaths[entry.filename] else {
-                // This entry's data was already written (modifying existing archive)
-                continue
-            }
-
-            // Read file data from source (uncompressed archives only reach here)
-            guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: sourcePath)) else {
-                throw CopperError.readError("Cannot read source file at \(sourcePath)")
-            }
-
-            // Verify data length matches (should be uncompressed)
-            guard UInt64(fileData.count) == entry.length else {
-                throw CopperError.writeError("File size mismatch for \(entry.filename)")
-            }
-
-            // Seek to the correct offset and write data
-            handle.seek(toFileOffset: entry.offset)
-            try handle.write(contentsOf: fileData)
-        }
-
-        // Clear cache after writing
-        compressedDataCache.removeAll()
-
-        try handle.synchronize()
+        // This method is now only used by save() or other methods if needed, 
+        // but writeToFile handles its own data writing.
+        // However, if we are just updating metadata, we don't rewrite data section.
+        // If we are compacting, we use compactArchive().
+        
+        // The original implementation used compressedDataCache or sourceFilePaths.
+        // Since we removed compressedDataCache and writeToFile handles sourceFilePaths,
+        // this method might be redundant or needs to be adapted for other use cases.
+        // For now, we'll leave it empty or remove it if not used.
+        // But wait, if we add files to an existing archive, we use addFile which writes immediately.
+        // So this method was only for writeToFile.
+        // So we can remove it or leave it as a stub/deprecated.
     }
 
     /// Add multiple files to the archive at once
-    mutating func addFiles(filePaths: [String]) throws {
+    public mutating func addFiles(filePaths: [String]) throws {
         for filePath in filePaths {
             try addFile(at: filePath)
         }
@@ -1171,7 +1313,7 @@ extension CopperArchive {
     // MARK: - Archive Reading
 
     /// Open and parse an existing Copper archive from disk
-    static func open(path: String, encryptionKey: Data? = nil) throws -> CopperArchive {
+    public static func open(path: String, encryptionKey: Data? = nil) throws -> CopperArchive {
         let fileManager = FileManager.default
 
         guard fileManager.fileExists(atPath: path) else {
@@ -1182,13 +1324,21 @@ extension CopperArchive {
             throw CopperError.readError("Cannot open file for reading at \(path)")
         }
 
-        // Read and parse header
-        guard let headerData = try handle.read(upToCount: Int(CopperHeader.headerLength)) else {
-            throw CopperError.readError("Cannot read header")
+        // Read Magic (4) + Version (1) + Length (8) = 13 bytes
+        guard let preamble = try handle.read(upToCount: 13) else {
+            throw CopperError.readError("Cannot read header preamble")
         }
-
-        guard headerData.count == Int(CopperHeader.headerLength) else {
-            throw CopperError.corruptedArchive("Header size mismatch")
+        
+        let magic = Array(preamble[0..<4])
+        guard magic == COPPER_MAGIC_NUMBER else { throw CopperError.corruptedArchive("Invalid magic number") }
+        
+        // let version = preamble[4] // Not used here, but parsed in parseHeader
+        let headerLength = preamble.readUInt64(at: 5)
+        
+        // Read full header
+        handle.seek(toFileOffset: 0)
+        guard let headerData = try handle.read(upToCount: Int(headerLength)) else {
+            throw CopperError.readError("Cannot read header")
         }
 
         let header = try parseHeader(from: headerData)
@@ -1208,19 +1358,57 @@ extension CopperArchive {
         // Seek to file entry section
         handle.seek(toFileOffset: header.fileEntryOffset)
 
+
+        // Determine if file entry section is encrypted
+        let isEncrypted = header.encryptionAlgorithm != CopperEncryptionAlgorithm.none.rawValue
+
+
         // Read file entry section
-        guard let fileEntrySectionData = try handle.read(upToCount: 16) else {
-            throw CopperError.readError("Cannot read file entry section header")
+        // First, we need to determine how much to read
+        // If encrypted, we need to read until the data section offset
+        // If not encrypted, we can read the length field first
+        let fileEntrySectionData: Data
+        
+        if isEncrypted {
+            // Read entire encrypted file entry section (from FE_OFFSET to DATA_OFFSET)
+            let encryptedLength = header.dataOffset - header.fileEntryOffset
+            // REVIEW: Reading potentially large encrypted section into memory.
+            guard let encryptedData = try handle.read(upToCount: Int(encryptedLength)) else {
+                throw CopperError.readError("Cannot read encrypted file entry section")
+            }
+            
+            // Decrypt the file entry section
+            guard let key = encryptionKey else {
+                throw CopperError.encryptionError("Archive is encrypted but no key provided")
+            }
+            let encAlgo = CopperEncryptionAlgorithm(rawValue: header.encryptionAlgorithm) ?? .none
+            fileEntrySectionData = try encAlgo.decrypt(encryptedData, key: key)
+        } else {
+            // Read unencrypted length header
+            guard let lengthData = try handle.read(upToCount: CopperConstants.fileEntryHeaderLength) else {
+                throw CopperError.readError("Cannot read file entry section header")
+            }
+            
+            let sectionLength = lengthData.readUInt64(at: 0)
+            
+            // Read the rest of the section
+            guard let remainingData = try handle.read(upToCount: Int(sectionLength) - CopperConstants.fileEntryHeaderLength) else {
+                throw CopperError.readError("Cannot read file entry section data")
+            }
+            
+            fileEntrySectionData = lengthData + remainingData
         }
 
+        // Parse the (now decrypted) file entry section
         let _ = fileEntrySectionData.readUInt64(at: 0)
         let fileCount = fileEntrySectionData.readUInt64(at: 8)
 
-        // Read all file entries
+        // Parse all file entries from the decrypted data
         var fileEntries: [CopperFileEntry] = []
+        var offset = CopperConstants.fileEntryHeaderLength  // Skip LENGTH and COUNT fields
 
         for _ in 0..<fileCount {
-            let entry = try parseFileEntry(from: handle)
+            let entry = try parseFileEntryFromData(fileEntrySectionData, offset: &offset)
             fileEntries.append(entry)
         }
 
@@ -1236,10 +1424,9 @@ extension CopperArchive {
 
     /// Parse header from binary data
     private static func parseHeader(from data: Data) throws -> CopperHeader {
-        guard data.count >= Int(CopperHeader.headerLength) else {
-            throw CopperError.corruptedArchive("Header data too short")
-        }
-
+        // We don't check against CopperHeader.headerLength constant because it might vary by version.
+        // We rely on the LENGTH field in the data.
+        
         var offset = 0
 
         // MAGIC - 4 bytes
@@ -1251,14 +1438,18 @@ extension CopperArchive {
 
         // VERSION - 1 byte
         let version = data[offset]
-        guard version == COPPER_VERSION_CURRENT else {
+        guard version <= COPPER_VERSION_CURRENT else {
             throw CopperError.corruptedArchive("Unsupported version: \(version)")
         }
         offset += 1
 
         // LENGTH - 8 bytes
-        let _ = data.readUInt64(at: offset)
+        let headerLength = data.readUInt64(at: offset)
         offset += 8
+        
+        guard data.count >= Int(headerLength) else {
+            throw CopperError.corruptedArchive("Header data too short")
+        }
 
         // FLAGS - 8 bytes
         let flags = data.readUInt64(at: offset)
@@ -1277,8 +1468,8 @@ extension CopperArchive {
         offset += 1
 
         // ENC_KEY_HASH - 32 bytes
-        let encryptionKeyHash = Array(data[offset..<offset + 32])
-        offset += 32
+        let encryptionKeyHash = Array(data[offset..<offset + CopperConstants.hashSize])
+        offset += CopperConstants.hashSize
 
         // FE_OFFSET - 8 bytes
         let fileEntryOffset = data.readUInt64(at: offset)
@@ -1287,19 +1478,23 @@ extension CopperArchive {
         // DATA_OFFSET - 8 bytes
         let dataOffset = data.readUInt64(at: offset)
         offset += 8
+        
+        // SALT - 32 bytes
+        let salt = Array(data[offset..<offset+CopperConstants.saltSize])
+        offset += CopperConstants.saltSize
 
         // RESERVED - 32 bytes
-        let reserved = Array(data[offset..<offset + 32])
-        offset += 32
+        let reserved = Array(data[offset..<offset + CopperConstants.reservedSize])
+        offset += CopperConstants.reservedSize
 
         // HEADER_HASH - 32 bytes
-        let headerHash = Array(data[offset..<offset + 32])
+        let headerHash = Array(data[offset..<offset + CopperConstants.hashSize])
 
         // Verify header hash
         let headerDataWithoutHash = data[0..<offset]
         let computedHash = headerDataWithoutHash.sha256Hash()
         guard computedHash == headerHash else {
-            throw CopperError.corruptedArchive("Header hash mismatch")
+            throw CopperError.corruptedArchive("Header hash mismatch, Archive may be corrupted")
         }
 
         var header = CopperHeader()
@@ -1310,10 +1505,97 @@ extension CopperArchive {
         header.encryptionKeyHash = encryptionKeyHash
         header.fileEntryOffset = fileEntryOffset
         header.dataOffset = dataOffset
+        header.salt = salt
         header.reserved = reserved
         header.headerHash = headerHash
 
         return header
+    }
+    
+    /// Get the salt from an archive header without opening the full archive
+    public static func getSalt(from path: String) throws -> Data? {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: path) else {
+            throw CopperError.fileNotFound(path)
+        }
+        
+        guard let handle = FileHandle(forReadingAtPath: path) else {
+            throw CopperError.readError("Cannot open file at \(path)")
+        }
+        defer { try? handle.close() }
+        
+        // Read preamble
+        guard let preamble = try handle.read(upToCount: 13) else {
+            throw CopperError.readError("Cannot read header preamble")
+        }
+        
+        let headerLength = preamble.readUInt64(at: 5)
+        
+        // Read full header
+        handle.seek(toFileOffset: 0)
+        guard let headerData = try handle.read(upToCount: Int(headerLength)) else {
+            throw CopperError.readError("Cannot read header")
+        }
+        
+        let header = try parseHeader(from: headerData)
+        return Data(header.salt)
+    }
+
+    /// Parse a single file entry from a data buffer
+    private static func parseFileEntryFromData(_ data: Data, offset: inout Int) throws -> CopperFileEntry {
+        // FILENAME_LENGTH - 2 bytes
+        guard offset + 2 <= data.count else {
+            throw CopperError.readError("Cannot read filename length")
+        }
+        let filenameLength = data.readUInt16(at: offset)
+        offset += 2
+
+        // FILENAME - variable bytes
+        guard offset + Int(filenameLength) <= data.count else {
+            throw CopperError.readError("Cannot read filename")
+        }
+        let filenameData = data[offset..<offset + Int(filenameLength)]
+        guard let filename = String(data: filenameData, encoding: .utf8) else {
+            throw CopperError.corruptedArchive("Invalid filename encoding")
+        }
+        offset += Int(filenameLength)
+
+        // Read the rest of the entry (OFFSET, LENGTH, TIMESTAMP, PERMISSIONS, HASH)
+        // Total: 8 + 8 + 8 + 2 + 32 = 58 bytes
+        guard offset + CopperConstants.fileEntryFixedSize <= data.count else {
+            throw CopperError.readError("Cannot read file entry data")
+        }
+
+        // OFFSET - 8 bytes
+        let fileOffset = data.readUInt64(at: offset)
+        offset += 8
+
+        // LENGTH - 8 bytes
+        let length = data.readUInt64(at: offset)
+        offset += 8
+
+        // TIMESTAMP - 8 bytes
+        let timestamp = data.readUInt64(at: offset)
+        offset += 8
+
+        // PERMISSIONS - 2 bytes
+        let permissions = data.readUInt16(at: offset)
+        offset += 2
+
+        // HASH - 32 bytes
+        let hash = Array(data[offset..<offset + CopperConstants.hashSize])
+        offset += CopperConstants.hashSize
+
+        var entry = CopperFileEntry()
+        entry.filenameLength = filenameLength
+        entry.filename = filename
+        entry.offset = fileOffset
+        entry.length = length
+        entry.timestamp = timestamp
+        entry.permissions = permissions
+        entry.hash = hash
+
+        return entry
     }
 
     /// Parse a single file entry from the file handle
@@ -1334,7 +1616,7 @@ extension CopperArchive {
 
         // Read the rest of the entry (OFFSET, LENGTH, TIMESTAMP, PERMISSIONS, HASH)
         // Total: 8 + 8 + 8 + 2 + 32 = 58 bytes
-        guard let entryData = try handle.read(upToCount: 58) else {
+        guard let entryData = try handle.read(upToCount: CopperConstants.fileEntryFixedSize) else {
             throw CopperError.readError("Cannot read file entry data")
         }
 
@@ -1357,7 +1639,7 @@ extension CopperArchive {
         offset += 2
 
         // HASH - 32 bytes
-        let hash = Array(entryData[offset..<offset + 32])
+        let hash = Array(entryData[offset..<offset + CopperConstants.hashSize])
 
         var entry = CopperFileEntry()
         entry.filenameLength = filenameLength
@@ -1371,15 +1653,90 @@ extension CopperArchive {
         return entry
     }
 
+    /// Shift the entire data section by a given amount
+    private mutating func shiftDataSection(by shiftAmount: Int64, handle: FileHandle) throws {
+        // Find end of data (excluding end marker)
+        var endOfData = header.dataOffset
+        for entry in fileEntries {
+            let entryEnd = entry.offset + entry.length
+            if entryEnd > endOfData {
+                endOfData = entryEnd
+            }
+        }
+        
+        let dataLength = endOfData - header.dataOffset
+        if dataLength == 0 { return }
+        
+        let oldStart = header.dataOffset
+        let newStart = UInt64(Int64(oldStart) + shiftAmount)
+        
+        let bufferSize = CopperConstants.defaultBufferSize // 1 MB
+        var bytesRemaining = dataLength
+        
+        if shiftAmount > 0 {
+            // Moving right (expand) - Copy backward
+            var currentReadOffset = oldStart + dataLength
+            var currentWriteOffset = newStart + dataLength
+            
+            while bytesRemaining > 0 {
+                let bytesToRead = min(UInt64(bufferSize), bytesRemaining)
+                let chunkReadStart = currentReadOffset - bytesToRead
+                let chunkWriteStart = currentWriteOffset - bytesToRead
+                
+                handle.seek(toFileOffset: chunkReadStart)
+                guard let data = try handle.read(upToCount: Int(bytesToRead)) else {
+                    throw CopperError.readError("Failed to read data during shift")
+                }
+                
+                handle.seek(toFileOffset: chunkWriteStart)
+                try handle.write(contentsOf: data)
+                
+                currentReadOffset -= bytesToRead
+                currentWriteOffset -= bytesToRead
+                bytesRemaining -= bytesToRead
+            }
+        } else {
+            // Moving left (shrink) - Copy forward
+            var currentReadOffset = oldStart
+            var currentWriteOffset = newStart
+            
+            while bytesRemaining > 0 {
+                let bytesToRead = min(UInt64(bufferSize), bytesRemaining)
+                
+                handle.seek(toFileOffset: currentReadOffset)
+                guard let data = try handle.read(upToCount: Int(bytesToRead)) else {
+                    throw CopperError.readError("Failed to read data during shift")
+                }
+                
+                handle.seek(toFileOffset: currentWriteOffset)
+                try handle.write(contentsOf: data)
+                
+                currentReadOffset += bytesToRead
+                currentWriteOffset += bytesToRead
+                bytesRemaining -= bytesToRead
+            }
+        }
+        
+        // Update all offsets
+        for i in 0..<fileEntries.count {
+            fileEntries[i].offset = UInt64(Int64(fileEntries[i].offset) + shiftAmount)
+        }
+        
+        for i in 0..<freeSpaces.count {
+            freeSpaces[i].offset = UInt64(Int64(freeSpaces[i].offset) + shiftAmount)
+        }
+    }
+
     /// Save changes to an existing archive (updates header and file entry section)
     /// This is more efficient than rewriting the entire archive when only metadata changes
-    mutating func save() throws {
+    public mutating func save() throws {
         guard !filePath.isEmpty else {
             throw CopperError.writeError(
                 "Archive path not set. Use writeToFile() to create new archive.")
         }
 
-        guard let handle = FileHandle(forWritingAtPath: filePath) else {
+        // print("DEBUG: Opening \(filePath) for updating in save")
+        guard let handle = FileHandle(forUpdatingAtPath: filePath) else {
             throw CopperError.writeError("Cannot open archive for writing at \(filePath)")
         }
 
@@ -1392,9 +1749,19 @@ extension CopperArchive {
         // Recalculate offsets in case file entries changed
         let headerSize = CopperHeader.headerLength
         let fileEntrySize = calculateFileEntrySectionSize()
+        // If encryption is enabled, the file entry section will be larger due to nonce + tag
+        let actualFileEntrySize = encryptionEnabled ? fileEntrySize + UInt64(CopperConstants.aesGcmOverhead) : fileEntrySize
+
+        let oldDataOffset = header.dataOffset
+        let newDataOffset = headerSize + actualFileEntrySize
+        
+        if newDataOffset != oldDataOffset {
+            let shiftAmount = Int64(newDataOffset) - Int64(oldDataOffset)
+            try shiftDataSection(by: shiftAmount, handle: handle)
+            header.dataOffset = newDataOffset
+        }
 
         header.fileEntryOffset = headerSize
-        header.dataOffset = headerSize + fileEntrySize
         header.timestamp = UInt64(Date().timeIntervalSince1970)
 
         // Rewrite header
@@ -1405,12 +1772,26 @@ extension CopperArchive {
         // Rewrite file entry section
         handle.seek(toFileOffset: header.fileEntryOffset)
         try writeFileEntrySection(to: handle)
+        
+        // If we shifted, we need to rewrite the end marker at the new position
+        // Find end of data
+        var endOfData = header.dataOffset
+        for entry in fileEntries {
+            let entryEnd = entry.offset + entry.length
+            if entryEnd > endOfData {
+                endOfData = entryEnd
+            }
+        }
+        
+        handle.seek(toFileOffset: endOfData)
+        try handle.write(contentsOf: Data(endMarker))
+        try handle.truncate(atOffset: endOfData + UInt64(CopperConstants.endMarkerLength))
 
         try handle.synchronize()
     }
 
     /// Extract a file from the archive to disk
-    func extractFile(filename: String, toPath: String) throws {
+    public func extractFile(filename: String, toPath: String) throws {
         guard let entry = fileEntries.first(where: { $0.filename == filename }) else {
             throw CopperError.fileNotFound(filename)
         }
@@ -1422,51 +1803,135 @@ extension CopperArchive {
         defer {
             try? handle.close()
         }
-
-        // Read file data (possibly compressed and/or encrypted)
-        handle.seek(toFileOffset: entry.offset)
-        guard let storedData = try handle.read(upToCount: Int(entry.length)) else {
-            throw CopperError.readError("Cannot read file data for \(filename)")
-        }
-
-        guard storedData.count == Int(entry.length) else {
-            throw CopperError.corruptedArchive("File data size mismatch for \(filename)")
-        }
-
-        // Decrypt if needed (decrypt BEFORE decompression)
-        var processedData = storedData
-        if encryptionEnabled {
-            guard let key = encryptionKey else {
-                throw CopperError.encryptionError("Archive is encrypted but no key provided")
-            }
-            processedData = try encryptionAlgorithm.decrypt(processedData, key: key)
-        }
-
-        // Decompress if needed
-        let fileData: Data
-        if compressionEnabled {
-            // Decompress the data - we'll allocate a reasonable buffer
-            // The compression library will handle the exact size
-            fileData = try compressionAlgorithm.decompress(processedData, uncompressedSize: 0)
-        } else {
-            fileData = processedData
-        }
-
-        // Verify hash of UNCOMPRESSED data
-        let computedHash = fileData.sha256Hash()
-        guard computedHash == entry.hash else {
-            throw CopperError.corruptedArchive("File hash mismatch for \(filename)")
-        }
-
+        
         // Create parent directory if needed
         let fileManager = FileManager.default
         let directory = (toPath as NSString).deletingLastPathComponent
         if !directory.isEmpty && !fileManager.fileExists(atPath: directory) {
             try fileManager.createDirectory(atPath: directory, withIntermediateDirectories: true)
         }
+        
+        // Create output file
+        _ = fileManager.createFile(atPath: toPath, contents: nil)
+        guard let outHandle = FileHandle(forWritingAtPath: toPath) else {
+            throw CopperError.writeError("Cannot open output file at \(toPath)")
+        }
+        defer { try? outHandle.close() }
 
-        // Write to disk
-        try fileData.write(to: URL(fileURLWithPath: toPath))
+        if encryptionEnabled {
+            // Encrypted: Must read full file into memory (limitation of AES-GCM)
+            handle.seek(toFileOffset: entry.offset)
+            guard let storedData = try handle.read(upToCount: Int(entry.length)) else {
+                throw CopperError.readError("Cannot read file data for \(filename)")
+            }
+            
+            guard let key = encryptionKey else {
+                throw CopperError.encryptionError("Archive is encrypted but no key provided")
+            }
+            
+            let decryptedData = try encryptionAlgorithm.decrypt(storedData, key: key)
+            
+            // Decompress if needed
+            let finalData: Data
+            if compressionEnabled {
+                finalData = try compressionAlgorithm.decompress(decryptedData, uncompressedSize: 0)
+            } else {
+                finalData = decryptedData
+            }
+            
+            // Verify hash
+            let computedHash = finalData.sha256Hash()
+            guard computedHash == entry.hash else {
+                throw CopperError.corruptedArchive("File hash mismatch for \(filename)")
+            }
+            
+            try outHandle.write(contentsOf: finalData)
+            
+        } else if compressionEnabled {
+            // Compressed but not encrypted: Stream decompression
+            handle.seek(toFileOffset: entry.offset)
+            
+            // Initialize zlib stream
+            var stream = z_stream()
+            stream.zalloc = nil
+            stream.zfree = nil
+            stream.opaque = nil
+            
+            guard inflateInit_(&stream, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else {
+                throw CopperError.compressionError("zlib init failed")
+            }
+            defer { inflateEnd(&stream) }
+            
+            let inBufferSize = CopperConstants.defaultChunkSize
+            let outBufferSize = CopperConstants.defaultChunkSize
+            var outBuffer = Data(count: outBufferSize)
+            
+            var bytesRead: UInt64 = 0
+            var hasher = SHA256()
+            
+            while bytesRead < entry.length {
+                let bytesToRead = min(UInt64(inBufferSize), entry.length - bytesRead)
+                guard let chunk = try handle.read(upToCount: Int(bytesToRead)) else {
+                    throw CopperError.readError("Unexpected end of file")
+                }
+                bytesRead += UInt64(chunk.count)
+                
+                // Feed to zlib
+                try chunk.withUnsafeBytes { (inPtr: UnsafeRawBufferPointer) in
+                    stream.avail_in = UInt32(chunk.count)
+                    stream.next_in = UnsafeMutablePointer(mutating: inPtr.baseAddress?.assumingMemoryBound(to: UInt8.self))
+                    
+                    repeat {
+                        try outBuffer.withUnsafeMutableBytes { (outPtr: UnsafeMutableRawBufferPointer) in
+                            stream.avail_out = UInt32(outBufferSize)
+                            stream.next_out = outPtr.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                            
+                            let ret = inflate(&stream, Z_NO_FLUSH)
+                            if ret != Z_OK && ret != Z_STREAM_END {
+                                throw CopperError.compressionError("zlib inflate failed: \(ret)")
+                            }
+                            
+                            let have = outBufferSize - Int(stream.avail_out)
+                            if have > 0 {
+                                // Use the pointer to create data to avoid overlapping access
+                                let outputChunk = Data(bytes: outPtr.baseAddress!, count: have)
+                                try outHandle.write(contentsOf: outputChunk)
+                                hasher.update(data: outputChunk)
+                            }
+                        }
+                    } while stream.avail_out == 0
+                }
+            }
+            
+            // Verify hash
+            let computedHash = Array(hasher.finalize())
+            guard computedHash == entry.hash else {
+                throw CopperError.corruptedArchive("File hash mismatch for \(filename)")
+            }
+            
+        } else {
+            // Neither encrypted nor compressed: Stream copy
+            handle.seek(toFileOffset: entry.offset)
+            var bytesRemaining = entry.length
+            let bufferSize = CopperConstants.defaultBufferSize
+            var hasher = SHA256()
+            
+            while bytesRemaining > 0 {
+                let bytesToRead = min(UInt64(bufferSize), bytesRemaining)
+                guard let data = try handle.read(upToCount: Int(bytesToRead)) else {
+                    throw CopperError.readError("Unexpected end of file")
+                }
+                
+                try outHandle.write(contentsOf: data)
+                hasher.update(data: data)
+                bytesRemaining -= UInt64(data.count)
+            }
+            
+            let computedHash = Array(hasher.finalize())
+            guard computedHash == entry.hash else {
+                throw CopperError.corruptedArchive("File hash mismatch for \(filename)")
+            }
+        }
 
         // Restore permissions and timestamp
         try fileManager.setAttributes(
@@ -1477,7 +1942,7 @@ extension CopperArchive {
     }
 
     /// Extract all files from the archive to a directory
-    func extractAll(toDirectory: String) throws {
+    public func extractAll(toDirectory: String) throws {
         let fileManager = FileManager.default
 
         // Create directory if needed
@@ -1489,5 +1954,51 @@ extension CopperArchive {
             let outputPath = (toDirectory as NSString).appendingPathComponent(entry.filename)
             try extractFile(filename: entry.filename, toPath: outputPath)
         }
+    }
+
+    /// Extract a subfolder from the archive to a destination directory
+    public func extractSubfolder(folderPath: String, to destinationDirectory: String) throws {
+        // Normalize folder path to ensure it ends with / for prefix matching
+        let normalizedFolder = folderPath.hasSuffix("/") ? folderPath : folderPath + "/"
+        
+        // Find all entries that start with the folder path
+        let entries = fileEntries.filter { $0.filename.hasPrefix(normalizedFolder) }
+        
+        if entries.isEmpty {
+            throw CopperError.fileNotFound(folderPath)
+        }
+        
+        for entry in entries {
+            let outputPath = (destinationDirectory as NSString).appendingPathComponent(entry.filename)
+            try extractFile(filename: entry.filename, toPath: outputPath)
+        }
+    }
+
+    /// Extract a selection of files or folders to a destination directory
+    public func extractSelection(paths: [String], to destinationDirectory: String) throws {
+        for path in paths {
+            // Check if it's a file
+            if findFileEntry(filename: path) != nil {
+                let outputPath = (destinationDirectory as NSString).appendingPathComponent(path)
+                try extractFile(filename: path, toPath: outputPath)
+            } else {
+                // Try as subfolder
+                try extractSubfolder(folderPath: path, to: destinationDirectory)
+            }
+        }
+    }
+
+    /// Add a subfolder to the archive
+    public mutating func addSubfolder(at path: String, baseDir: String? = nil) throws {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw CopperError.readError("Path is not a directory: \(path)")
+        }
+        try addPath(at: path, baseDir: baseDir)
+    }
+
+    /// Add a selection of paths (files or folders) to the archive
+    public mutating func addSelection(paths: [String]) throws {
+        try addPaths(paths)
     }
 }

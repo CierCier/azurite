@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Azurite
+Comment=Manage Copper Archives
+Exec=bash -c "MPOINT=\"/run/user/$(id -u)/azurite/$(basename \"%f\")\"; mkdir -p \"$MPOINT\"; mount-copper \"%f\" \"$MPOINT\" && xdg-open \"$MPOINT\""
+Icon=package-x-generic
+Terminal=false
+MimeType=application/x-azurite;
+Categories=Utility;Archiving;
+
+# Right-click action: Extract Here
+Actions=Extract;
+
+[Desktop Action Extract]
+Name=Extract Here
+Exec=azurite -x --file %f

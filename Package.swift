@@ -5,6 +5,11 @@ import PackageDescription
 
 let package = Package(
     name: "azurite",
+    products: [
+        .executable(name: "azurite", targets: ["azurite"]),
+        .executable(name: "mount-copper", targets: ["mount-copper"]),
+        .library(name: "Copper", targets: ["Copper"]),
+    ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.2.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", "1.0.0" ..< "5.0.0"),
@@ -15,12 +20,35 @@ let package = Package(
         .systemLibrary(
             name: "Czlib"
         ),
+        .systemLibrary(
+            name: "Cfuse",
+            pkgConfig: "fuse3",
+            providers: [
+                .apt(["libfuse3-dev"]),
+                .brew(["fuse"]),
+                .yum(["fuse3-devel"])
+            ]
+        ),
+        .target(
+            name: "Copper",
+            dependencies: [
+                .product(name: "Crypto", package: "swift-crypto"),
+                "Czlib",
+            ]
+        ),
         .executableTarget(
             name: "azurite",
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
-                .product(name: "Crypto", package: "swift-crypto"),
-                "Czlib",
+                "Copper",
+            ]
+        ),
+        .executableTarget(
+            name: "mount-copper",
+            dependencies: [
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                "Cfuse",
+                "Copper",
             ]
         ),
     ]

@@ -1,5 +1,6 @@
 import ArgumentParser
 import Foundation
+import Copper
 
 @main
 struct Azurite: ParsableCommand {
@@ -86,8 +87,11 @@ struct Azurite: ParsableCommand {
     // MARK: - Operation Methods
 
     mutating func runExtract() throws {
+        // Get salt from archive if it exists
+        let salt = try? CopperArchive.getSalt(from: file)
+
         // Derive encryption key from password if provided
-        let encryptionKey = try key.map { try CopperEncryptionAlgorithm.deriveKey(from: $0) }
+        let encryptionKey = try key.map { try CopperEncryptionAlgorithm.deriveKey(from: $0, salt: salt) }
 
         // Open archive
         if verbose {
@@ -212,14 +216,19 @@ extension Azurite {
         
             // Get encryption key if needed
             var encryptionKey: Data?
+            var salt: Data?
+            
             if encryptionAlgo != .none {
                 guard let keyString = key else {
                     print("Error: Encryption key required when using encryption")
                     throw ExitCode.validationFailure
                 }
                 
-                // Derive a proper 256-bit key from the password
-                encryptionKey = try CopperEncryptionAlgorithm.deriveKey(from: keyString)
+                // Generate a random salt for the new archive
+                salt = Data((0..<CopperConstants.saltSize).map { _ in UInt8.random(in: 0...255) })
+                
+                // Derive a proper 256-bit key from the password using the new salt
+                encryptionKey = try CopperEncryptionAlgorithm.deriveKey(from: keyString, salt: salt)
             }
 
             // Create archive
@@ -227,7 +236,8 @@ extension Azurite {
             var archive = CopperArchive.createNew(
                 compressionAlgorithm: compressionAlgo,
                 encryptionAlgorithm: encryptionAlgo,
-                encryptionKey: encryptionKey
+                encryptionKey: encryptionKey,
+                salt: salt
             )
 
             // Add files if provided
@@ -268,8 +278,11 @@ extension Azurite {
         var key: String?
 
         func run() throws {
+            // Get salt from archive if it exists
+            let salt = try? CopperArchive.getSalt(from: archivePath)
+
             // Derive encryption key from password if provided
-            let encryptionKey = try key.map { try CopperEncryptionAlgorithm.deriveKey(from: $0) }
+            let encryptionKey = try key.map { try CopperEncryptionAlgorithm.deriveKey(from: $0, salt: salt) }
 
             // Open archive
             print("Opening archive at \(archivePath)...")
@@ -324,7 +337,11 @@ extension Azurite {
         var key: String?
 
         func run() throws {
-            let encryptionKey = key?.data(using: .utf8)
+            // Get salt from archive if it exists
+            let salt = try? CopperArchive.getSalt(from: archivePath)
+            
+            // Derive encryption key from password if provided
+            let encryptionKey = try key.map { try CopperEncryptionAlgorithm.deriveKey(from: $0, salt: salt) }
 
             // Open archive
             print("Opening archive at \(archivePath)...")
@@ -364,8 +381,11 @@ extension Azurite {
         var verbose: Bool = false
 
         func run() throws {
+            // Get salt from archive if it exists
+            let salt = try? CopperArchive.getSalt(from: archivePath)
+
             // Derive encryption key from password if provided
-            let encryptionKey = try key.map { try CopperEncryptionAlgorithm.deriveKey(from: $0) }
+            let encryptionKey = try key.map { try CopperEncryptionAlgorithm.deriveKey(from: $0, salt: salt) }
 
             // Open archive
             let archive = try CopperArchive.open(path: archivePath, encryptionKey: encryptionKey)
@@ -481,8 +501,11 @@ extension Azurite {
         var key: String?
 
         func run() throws {
+            // Get salt from archive if it exists
+            let salt = try? CopperArchive.getSalt(from: archivePath)
+
             // Derive encryption key from password if provided
-            let encryptionKey = try key.map { try CopperEncryptionAlgorithm.deriveKey(from: $0) }
+            let encryptionKey = try key.map { try CopperEncryptionAlgorithm.deriveKey(from: $0, salt: salt) }
 
             // Open archive
             print("Opening archive at \(archivePath)...")
@@ -522,8 +545,11 @@ extension Azurite {
         var key: String?
 
         func run() throws {
+            // Get salt from archive if it exists
+            let salt = try? CopperArchive.getSalt(from: archivePath)
+
             // Derive encryption key from password if provided
-            let encryptionKey = try key.map { try CopperEncryptionAlgorithm.deriveKey(from: $0) }
+            let encryptionKey = try key.map { try CopperEncryptionAlgorithm.deriveKey(from: $0, salt: salt) }
 
             // Open archive
             print("Opening archive at \(archivePath)...")
@@ -561,8 +587,11 @@ extension Azurite {
         var key: String?
 
         func run() throws {
+            // Get salt from archive if it exists
+            let salt = try? CopperArchive.getSalt(from: archivePath)
+
             // Derive encryption key from password if provided
-            let encryptionKey = try key.map { try CopperEncryptionAlgorithm.deriveKey(from: $0) }
+            let encryptionKey = try key.map { try CopperEncryptionAlgorithm.deriveKey(from: $0, salt: salt) }
 
             // Open archive
             let archive = try CopperArchive.open(path: archivePath, encryptionKey: encryptionKey)
