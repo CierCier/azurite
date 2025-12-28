@@ -6,7 +6,7 @@ import PackageDescription
 let package = Package(
     name: "azurite",
     products: [
-        .executable(name: "azurite", targets: ["azurite"]),
+        .executable(name: "azt", targets: ["azurite"]),
         .executable(name: "copper-fuse", targets: ["copper-fuse"]),
         .library(name: "Copper", targets: ["Copper"]),
     ],

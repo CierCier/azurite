@@ -640,7 +640,7 @@ struct CopperFuseMount: ParsableCommand {
         }
 
         // Run FUSE
-        print(mountURL.standardized)  // for cli tools that need to know the mount point
+        print(mountURL.standardizedFileURL.path)  // for cli tools that need to know the mount point
 
         // Prepare arguments
         var args = [CommandLine.arguments[0], mountURL.path]
@@ -658,9 +658,9 @@ struct CopperFuseMount: ParsableCommand {
         // Cleanup
         for ptr in argv { free(ptr) }
         try? FileManager.default.removeItem(at: tempDir)
-        
+
         // and remove the mount point directory if we created it
-        if (mountPoint == nil) {
+        if mountPoint == nil {
             try? FileManager.default.removeItem(at: mountURL)
         }
 
