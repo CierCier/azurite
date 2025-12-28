@@ -7,7 +7,7 @@ let package = Package(
     name: "azurite",
     products: [
         .executable(name: "azurite", targets: ["azurite"]),
-        .executable(name: "mount-copper", targets: ["mount-copper"]),
+        .executable(name: "copper-fuse", targets: ["copper-fuse"]),
         .library(name: "Copper", targets: ["Copper"]),
     ],
     dependencies: [
@@ -44,7 +44,7 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "mount-copper",
+            name: "copper-fuse",
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 "Cfuse",
