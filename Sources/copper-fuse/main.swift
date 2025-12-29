@@ -14,6 +14,13 @@ import Foundation
 // Consider passing context via fuse_init or using a singleton manager that maps paths/IDs to instances.
 nonisolated(unsafe) var globalContext: MountContext?
 
+// Cleanup function for atexit
+func cleanup() {
+    if let context = globalContext {
+        try? FileManager.default.removeItem(at: context.tempDir)
+    }
+}
+
 class MountContext {
     var archive: CopperArchive
     var entryMap: [String: CopperFileEntry] = [:]
@@ -78,6 +85,76 @@ class MountContext {
     func removeDir(_ path: String) {
         queue.sync(flags: .barrier) {
             _ = dirMap.removeValue(forKey: path)
+        }
+    }
+
+    // MARK: - Atomic Operations
+
+    func atomicCreateFile(path: String, entry: CopperFileEntry) {
+        queue.sync(flags: .barrier) {
+            entryMap[path] = entry
+            
+            let parentPath = (path as NSString).deletingLastPathComponent
+            let childName = (path as NSString).lastPathComponent
+            
+            if dirMap[parentPath] == nil { dirMap[parentPath] = [] }
+            _ = dirMap[parentPath]?.insert(childName)
+        }
+    }
+
+    func atomicRemoveFile(path: String) {
+        queue.sync(flags: .barrier) {
+            _ = entryMap.removeValue(forKey: path)
+            
+            let parentPath = (path as NSString).deletingLastPathComponent
+            let childName = (path as NSString).lastPathComponent
+            
+            _ = dirMap[parentPath]?.remove(childName)
+        }
+    }
+
+    func atomicRenameFile(oldPath: String, newPath: String, newName: String) {
+        queue.sync(flags: .barrier) {
+            guard var entry = entryMap[oldPath] else { return }
+            
+            // Update entry
+            entry.filename = newName
+            entryMap[newPath] = entry
+            entryMap.removeValue(forKey: oldPath)
+            
+            // Update parent dirs
+            let oldParent = (oldPath as NSString).deletingLastPathComponent
+            let oldName = (oldPath as NSString).lastPathComponent
+            _ = dirMap[oldParent]?.remove(oldName)
+            
+            let newParent = (newPath as NSString).deletingLastPathComponent
+            let newNameStr = (newPath as NSString).lastPathComponent
+            
+            if dirMap[newParent] == nil { dirMap[newParent] = [] }
+            _ = dirMap[newParent]?.insert(newNameStr)
+        }
+    }
+
+    func atomicCreateDirectory(path: String) {
+        queue.sync(flags: .barrier) {
+            if dirMap[path] == nil { dirMap[path] = [] }
+            
+            let parentPath = (path as NSString).deletingLastPathComponent
+            let childName = (path as NSString).lastPathComponent
+            
+            if dirMap[parentPath] == nil { dirMap[parentPath] = [] }
+            _ = dirMap[parentPath]?.insert(childName)
+        }
+    }
+
+    func atomicRemoveDirectory(path: String) {
+        queue.sync(flags: .barrier) {
+            _ = dirMap.removeValue(forKey: path)
+            
+            let parentPath = (path as NSString).deletingLastPathComponent
+            let childName = (path as NSString).lastPathComponent
+            
+            _ = dirMap[parentPath]?.remove(childName)
         }
     }
 
@@ -192,6 +269,9 @@ struct CopperFuseMount: ParsableCommand {
 
         // Setup global state
         globalContext = MountContext(archive: archive, tempDir: tempDir)
+        
+        // Register cleanup handler
+        atexit(cleanup)
 
         // Initialize FUSE operations
         var ops = fuse_operations()
@@ -384,13 +464,8 @@ struct CopperFuseMount: ParsableCommand {
             entry.timestamp = UInt64(Date().timeIntervalSince1970)
             entry.length = 0
 
-            // FIX: Accessing globalEntryMap without a lock is not thread-safe.
-            context.setEntry(pathStr, entry: entry)
-
-            // Update parent dir
-            let parentPath = (pathStr as NSString).deletingLastPathComponent
-            // FIX: Accessing globalDirMap without a lock is not thread-safe.
-            context.addDirChild(parent: parentPath, child: (pathStr as NSString).lastPathComponent)
+            // Atomic update
+            context.atomicCreateFile(path: pathStr, entry: entry)
 
             return 0
         }
@@ -411,12 +486,7 @@ struct CopperFuseMount: ParsableCommand {
                     try archive.save()
                 }
 
-                context.removeEntry(pathStr)
-
-                // Update parent dir
-                let parentPath = (pathStr as NSString).deletingLastPathComponent
-                let fileName = (pathStr as NSString).lastPathComponent
-                context.removeDirChild(parent: parentPath, child: fileName)
+                context.atomicRemoveFile(path: pathStr)
 
                 // Remove temp file
                 let tempFile = context.tempDir.appendingPathComponent(pathStr)
@@ -499,22 +569,15 @@ struct CopperFuseMount: ParsableCommand {
             guard let context = globalContext else { return -EFAULT }
             let pathStr = String(cString: path)
 
-            // FIX: Accessing globalDirMap without a lock is not thread-safe.
             if context.isDir(pathStr) {
                 return -EEXIST
             }
 
-            context.createDir(pathStr)
-
             // Add to parent
-            let parentPath = (pathStr as NSString).deletingLastPathComponent
-            let dirName = (pathStr as NSString).lastPathComponent
-            context.addDirChild(parent: parentPath, child: dirName)
+            context.atomicCreateDirectory(path: pathStr)
 
             return 0
         }
-
-        // rmdir
         ops.rmdir = { (path) -> Int32 in
             guard let path = path else { return -EFAULT }
             guard let context = globalContext else { return -EFAULT }
@@ -524,12 +587,7 @@ struct CopperFuseMount: ParsableCommand {
                 return -ENOTEMPTY
             }
 
-            context.removeDir(pathStr)
-
-            // Remove from parent
-            let parentPath = (pathStr as NSString).deletingLastPathComponent
-            let dirName = (pathStr as NSString).lastPathComponent
-            context.removeDirChild(parent: parentPath, child: dirName)
+            context.atomicRemoveDirectory(path: pathStr)
 
             return 0
         }
@@ -590,7 +648,14 @@ struct CopperFuseMount: ParsableCommand {
 
             // FIX: Accessing globalDirMap without a lock is not thread-safe.
             if context.isDir(oldPathStr) {
-                // TODO: Implement directory renaming.
+                let od = context.getDirChildren(oldPathStr)
+
+                // check if target dir exists
+                if context.isDir(newPathStr) {
+                    return -EEXIST
+                }
+                // TODO: handle directory rename
+                
                 return -ENOSYS  // Not supported yet
             }
 
@@ -609,22 +674,7 @@ struct CopperFuseMount: ParsableCommand {
                 }
 
                 // Update maps
-                // FIX: Accessing globalEntryMap without a lock is not thread-safe.
-                if var entry = context.getEntry(oldPathStr) {
-                    entry.filename = newName
-                    context.setEntry(newPathStr, entry: entry)
-                    context.removeEntry(oldPathStr)
-                }
-
-                // Update parent dirs
-                let oldParent = (oldPathStr as NSString).deletingLastPathComponent
-                let oldFileName = (oldPathStr as NSString).lastPathComponent
-                // FIX: Accessing globalDirMap without a lock is not thread-safe.
-                context.removeDirChild(parent: oldParent, child: oldFileName)
-
-                let newParent = (newPathStr as NSString).deletingLastPathComponent
-                let newFileName = (newPathStr as NSString).lastPathComponent
-                context.addDirChild(parent: newParent, child: newFileName)
+                context.atomicRenameFile(oldPath: oldPathStr, newPath: newPathStr, newName: newName)
 
                 // Move temp file if exists
                 let oldTemp = context.tempDir.appendingPathComponent(oldPathStr)
@@ -650,14 +700,14 @@ struct CopperFuseMount: ParsableCommand {
 
         // Convert args to C-compatible format
         let argc = Int32(args.count)
-        var argv = args.map { strdup($0) }
-        argv.append(nil)  // Null terminator
-
+        var argv: [UnsafeMutablePointer<CChar>?] = args.map {
+            $0.withCString { strdup($0) }
+        }
         let ret = fuse_main_swift(argc, &argv, &ops, nil)
 
         // Cleanup
         for ptr in argv { free(ptr) }
-        try? FileManager.default.removeItem(at: tempDir)
+        // tempDir cleanup handled by atexit
 
         // and remove the mount point directory if we created it
         if mountPoint == nil {

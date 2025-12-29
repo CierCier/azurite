@@ -82,7 +82,9 @@ public struct CopperConstants {
     public static let saltSize = 32
     public static let reservedSize = 32
     public static let fileEntryFixedSize = 58
+    // DOCUMENT: 32KB chunk size for streaming operations.
     public static let defaultChunkSize = 32768
+    // DOCUMENT: 1MB buffer size for file operations.
     public static let defaultBufferSize = 1024 * 1024
     public static let maxDecompressedSize = 256 * 1024 * 1024
     public static let defaultPermissions: UInt16 = 0o644
@@ -219,6 +221,7 @@ public struct CopperArchive {
         let entry = fileEntries[index]
 
         // Mark the space as free
+        // TODO: For better security, we should optionally overwrite the data with zeros before marking as free.
         let freedSpace = CopperFreeSpace(offset: entry.offset, length: entry.length)
         freeSpaces.append(freedSpace)
 
@@ -931,6 +934,7 @@ extension CopperArchive {
         let fileManager = FileManager.default
         var isDirectory: ObjCBool = false
 
+        // REVIEW: Time-of-check to time-of-use (TOCTOU) race condition. File could be removed or changed between check and open.
         guard fileManager.fileExists(atPath: filePath, isDirectory: &isDirectory) else {
             throw CopperError.readError("File does not exist at \(filePath)")
         }

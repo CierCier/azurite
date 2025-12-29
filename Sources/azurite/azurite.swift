@@ -165,6 +165,7 @@ struct Azurite: ParsableCommand {
 
         if archiveExists {
             // Archive exists, switch to add mode
+            // REVIEW: Implicitly switching behavior based on file existence can be dangerous. Explicit flags are safer.
             if verbose {
                 print("Archive exists, adding files...")
             }
@@ -410,6 +411,7 @@ extension Azurite {
             // Get current user name
             let username = ProcessInfo.processInfo.environment["USER"] ?? "user"
 
+            // TODO: Use a proper table formatting library or logic to align columns dynamically.
             // List files in eza-style format
             for entry in archive.fileEntries {
                 let date = Date(timeIntervalSince1970: TimeInterval(entry.timestamp))
@@ -429,6 +431,7 @@ extension Azurite {
             var result = "."
 
             // Owner permissions
+            // DOCUMENT: 0o400 = Read, 0o200 = Write, 0o100 = Execute (Owner)
             result += (perms & 0o400) != 0 ? "r" : "-"
             result += (perms & 0o200) != 0 ? "w" : "-"
             result += (perms & 0o100) != 0 ? "x" : "-"
